@@ -18,7 +18,7 @@ st.set_page_config(
 
 NUMERIC_TOKEN_RE = re.compile(r"^-?\d+(?:\.\d+)?$|^\.$")
 SPEC_LINE_RE = re.compile(
-    r"Specification:\s*(\d+)\s+(.+?)\s*:\s*Cost/tonne:\s*([0-9.]+)",
+    r"Specification:\s*([^\s]+)\s+(.+?)\s*:\s*Cost/tonne:\s*([0-9.]+)",
     re.IGNORECASE,
 )
 
@@ -839,13 +839,20 @@ def render_candidate_detail(
 
 
 def repository_selector(label: str, repository: Repository, default_species: str | None = None) -> Tuple[str, pd.DataFrame]:
-    species_options = sorted(repository.products["species"].dropna().unique().tolist())
-    if not species_options:
-        species_options = ["Sin clasificar"]
+    species_values = sorted(repository.products["species"].dropna().unique().tolist())
+    if not species_values:
+        species_values = ["Sin clasificar"]
 
+    species_options = ["Todas"] + species_values
     default_index = species_options.index(default_species) if default_species in species_options else 0
     selected_species = st.selectbox(label, species_options, index=default_index)
-    filtered_products = repository.products[repository.products["species"] == selected_species].copy()
+
+    if selected_species == "Todas":
+        filtered_products = repository.products.copy()
+    else:
+        filtered_products = repository.products[repository.products["species"] == selected_species].copy()
+
+    filtered_products = filtered_products.sort_values(["species", "product_name", "spec_id"]).reset_index(drop=True)
     return selected_species, filtered_products
 
 
@@ -903,7 +910,7 @@ with sel_col1:
 
 with sel_col2:
     selected_target_species, target_products_filtered = repository_selector(
-        "Especie destino", target_repo, default_species=selected_source_species
+        "Especie destino", target_repo, default_species=selected_source_species if selected_source_species != "Todas" else None
     )
     compare_all_target_species = st.checkbox("Comparar contra toda la gama destino", value=False)
     if compare_all_target_species:
