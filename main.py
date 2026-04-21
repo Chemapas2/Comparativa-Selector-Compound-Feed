@@ -4,6 +4,8 @@ import io
 import math
 import re
 from dataclasses import dataclass
+from hashlib import md5
+from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -122,6 +124,98 @@ def display_float(value: float, decimals: int = 3) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return ""
     return f"{value:.{decimals}f}"
+
+
+def species_pref_key(species: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", normalize_text(species).lower()).strip("_")
+    return key or "global"
+
+
+def load_readme_text() -> str:
+    candidates = [
+        Path(__file__).with_name("README.md"),
+        Path.cwd() / "README.md",
+        Path("/mnt/data/README.md"),
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate.read_text(encoding="utf-8")
+        except Exception:
+            continue
+    return "README.md no disponible en esta ejecución."
+
+
+def heuristic_help_markdown() -> str:
+    return """
+### Cómo interpreta la app la similitud entre piensos
+
+La aplicación no decide automáticamente si un producto destino es válido o no. Construye un **ranking heurístico** para ayudarte a priorizar qué referencias estándar merecen revisión técnica.
+
+**Qué entra en el score total**
+- **Nutrientes**: compara las analíticas seleccionadas por el usuario.
+- **Ingredientes**: compara porcentajes de materias primas.
+- **Límites**: penaliza incompatibilidades de mínimos, máximos o tipo de restricción.
+- **Precio**: incorpora la desviación económica respecto al pienso origen.
+
+**Cómo leer el resultado**
+- **Score más bajo = mayor parecido relativo** dentro de esa comparación.
+- El score sirve para **ordenar candidatos**, no para aprobar automáticamente un cambio.
+- Un candidato puede quedar bien posicionado de forma global y aun así requerir revisión si falla en una métrica crítica o en un límite de ingrediente.
+
+**Qué conviene revisar siempre antes de decidir**
+1. Nutrientes críticos de la especie.
+2. Materias primas diferenciales y sus límites.
+3. Diferencia de precio.
+4. Encaje técnico-comercial y comportamiento esperado en campo.
+
+**Uso recomendado**
+Utiliza el ranking para reducir de forma drástica la revisión manual y valida técnicamente los 3-5 primeros candidatos.
+"""
+
+
+def get_metric_preferences(species: str, common_metrics: Iterable[str]) -> Tuple[List[str], Dict[str, float]]:
+    metrics_available = list(common_metrics)
+    prefs = st.session_state.setdefault("metric_preferences", {})
+    species_key = species_pref_key(species)
+    species_prefs = prefs.get(species_key, {})
+
+    saved_metrics = [metric for metric in species_prefs.get("selected_metrics", []) if metric in metrics_available]
+    if not saved_metrics:
+        saved_metrics = auto_select_metrics(metrics_available, species)
+
+    saved_weights = species_prefs.get("metric_weights", {})
+    resolved_weights = {
+        metric: float(saved_weights.get(metric, default_metric_weight(metric, species)))
+        for metric in metrics_available
+    }
+    return saved_metrics, resolved_weights
+
+
+def save_metric_preferences(species: str, selected_metrics: List[str], metric_weights: Dict[str, float]) -> None:
+    prefs = st.session_state.setdefault("metric_preferences", {})
+    species_key = species_pref_key(species)
+    existing = prefs.get(species_key, {})
+    merged_weights = dict(existing.get("metric_weights", {}))
+    merged_weights.update({metric: float(weight) for metric, weight in metric_weights.items()})
+    prefs[species_key] = {
+        "selected_metrics": list(selected_metrics),
+        "metric_weights": merged_weights,
+    }
+
+
+def reset_metric_preferences(species: str) -> None:
+    species_key = species_pref_key(species)
+    prefs = st.session_state.setdefault("metric_preferences", {})
+    prefs.pop(species_key, None)
+    multiselect_key = f"selected_metrics_{species_key}"
+    if multiselect_key in st.session_state:
+        del st.session_state[multiselect_key]
+
+
+def stable_metrics_signature(metrics: Iterable[str]) -> str:
+    joined = "|".join(metrics)
+    return md5(joined.encode("utf-8")).hexdigest()[:10]
 
 
 def infer_species(product_name: str, filename: str = "") -> str:
@@ -838,27 +932,143 @@ def render_candidate_detail(
         st.dataframe(ingredients_view, use_container_width=True, height=380)
 
 
-def repository_selector(label: str, repository: Repository, default_species: str | None = None) -> Tuple[str, pd.DataFrame]:
-    species_values = sorted(repository.products["species"].dropna().unique().tolist())
-    if not species_values:
-        species_values = ["Sin clasificar"]
+def build_comparison_report_text(
+    source_product_row: pd.Series,
+    selected_metrics: List[str],
+    metric_weights: Dict[str, float],
+    component_weights: Dict[str, float],
+    ranking_top: pd.DataFrame,
+    detail_map: Dict[str, dict],
+    source_repo: Repository,
+    target_repo: Repository,
+) -> str:
+    lines: List[str] = []
+    lines.append("INFORME DE COMPARATIVA DE PIENSOS - REBRANDING")
+    lines.append("=" * 72)
+    lines.append("")
+    lines.append("1. CONTEXTO DE LA COMPARATIVA")
+    lines.append(f"- Archivo origen: {source_repo.filename}")
+    lines.append(f"- Archivo destino: {target_repo.filename}")
+    lines.append(f"- Especie origen: {source_product_row['species']}")
+    lines.append(f"- Producto origen: {source_product_row['product_name']}")
+    lines.append(f"- Spec origen: {source_product_row['spec_id']}")
+    lines.append(f"- Precio origen €/t: {display_float(float(source_product_row['cost_tonne']), 3)}")
+    lines.append("")
+    lines.append("2. METODOLOGÍA HEURÍSTICA")
+    lines.append("- El ranking ordena candidatos destino por similitud relativa.")
+    lines.append("- Un score más bajo indica mayor parecido técnico-económico dentro de esta ejecución.")
+    lines.append("- El resultado no sustituye la validación técnica final del equipo.")
+    lines.append("")
+    lines.append("Pesos globales del score:")
+    for component, value in component_weights.items():
+        lines.append(f"  * {component}: {value:.2f}")
+    lines.append("")
+    lines.append("Métricas seleccionadas y peso específico:")
+    for metric in selected_metrics:
+        lines.append(f"  * {metric}: {metric_weights.get(metric, 1.0):.2f}")
+    lines.append("")
+    lines.append("3. RANKING DE CANDIDATOS")
+    for _, row in ranking_top.iterrows():
+        lines.append(
+            f"- #{int(row['rank'])} | {row['display_name']} | Score total {row['total_score']:.3f} | "
+            f"Precio €/t {row['cost_tonne']:.3f} | Dif. precio {row['price_diff_pct']:.2f}% | "
+            f"Ingredientes compartidos {int(row['shared_ingredients'])} | Métricas cubiertas {int(row['metric_coverage'])}"
+        )
 
-    species_options = ["Todas"] + species_values
+    for _, row in ranking_top.iterrows():
+        candidate_id = row["candidate_id"]
+        metric_details = detail_map[candidate_id]["metric_details"].copy()
+        ingredient_details = detail_map[candidate_id]["ingredient_details"].copy()
+
+        lines.append("")
+        lines.append("-" * 72)
+        lines.append(f"4.{int(row['rank'])} DETALLE DEL CANDIDATO #{int(row['rank'])}")
+        lines.append(f"Producto destino: {row['display_name']}")
+        lines.append(f"Spec destino: {row['spec_id']}")
+        lines.append(f"Especie destino: {row['species']}")
+        lines.append(f"Precio destino €/t: {row['cost_tonne']:.3f}")
+        lines.append(f"Score total: {row['total_score']:.3f}")
+        lines.append(f"Score nutrientes: {row['nutrient_score']:.3f}")
+        lines.append(f"Score ingredientes: {row['ingredient_score']:.3f}")
+        lines.append(f"Score límites: {row['limit_score']:.3f}")
+        lines.append(f"Score precio: {row['price_score']:.3f}")
+        lines.append(f"Dif. precio %: {row['price_diff_pct']:.2f}%")
+
+        lines.append("")
+        lines.append("Principales diferencias analíticas:")
+        metric_subset = metric_details.sort_values("impact", ascending=False).head(8)
+        if metric_subset.empty:
+            lines.append("  * Sin detalle analítico disponible.")
+        else:
+            for _, metric_row in metric_subset.iterrows():
+                lines.append(
+                    "  * "
+                    f"{metric_row['metric']}: actual {display_float(metric_row['actual'], 4)} | "
+                    f"destino {display_float(metric_row['candidate'], 4)} | "
+                    f"dif. abs. {display_float(metric_row['abs_gap'], 4)} | "
+                    f"impacto {display_float(metric_row['impact'], 4)}"
+                )
+
+        lines.append("")
+        lines.append("Principales diferencias de ingredientes:")
+        ingredient_subset = ingredient_details[ingredient_details['abs_gap_pct'] > 0].sort_values('abs_gap_pct', ascending=False).head(8)
+        if ingredient_subset.empty:
+            lines.append("  * Sin diferencias relevantes de ingredientes.")
+        else:
+            for _, ing_row in ingredient_subset.iterrows():
+                lines.append(
+                    "  * "
+                    f"{ing_row['ingredient']}: actual {display_float(ing_row['actual_pct'], 3)}% | "
+                    f"destino {display_float(ing_row['candidate_pct'], 3)}% | "
+                    f"dif. abs. {display_float(ing_row['abs_gap_pct'], 3)}% | "
+                    f"penalización límites {display_float(ing_row['limit_penalty'], 3)}"
+                )
+
+        limit_alerts = ingredient_details[ingredient_details['limit_penalty'] > 0].sort_values('limit_penalty', ascending=False).head(6)
+        lines.append("")
+        lines.append("Alertas de límites:")
+        if limit_alerts.empty:
+            lines.append("  * No se han detectado alertas de límites en los ingredientes revisados.")
+        else:
+            for _, alert_row in limit_alerts.iterrows():
+                lines.append(
+                    "  * "
+                    f"{alert_row['ingredient']}: límite actual {alert_row['actual_limit']} "
+                    f"[{display_float(alert_row['actual_min'], 3)} - {display_float(alert_row['actual_max'], 3)}] | "
+                    f"límite destino {alert_row['candidate_limit']} "
+                    f"[{display_float(alert_row['candidate_min'], 3)} - {display_float(alert_row['candidate_max'], 3)}] | "
+                    f"penalización {display_float(alert_row['limit_penalty'], 3)}"
+                )
+
+    lines.append("")
+    lines.append("5. CONCLUSIÓN OPERATIVA")
+    lines.append("- Este informe sirve para priorizar equivalencias técnicas y reducir revisión manual.")
+    lines.append("- La decisión final debe confirmar ajuste nutricional, viabilidad industrial, coste y encaje comercial.")
+    lines.append("- Se recomienda validar en detalle los primeros candidatos del ranking antes de migrar el SKU.")
+    return "\n".join(lines)
+
+
+def repository_selector(label: str, repository: Repository, default_species: str | None = None) -> Tuple[str, pd.DataFrame]:
+    species_options = sorted(repository.products["species"].dropna().unique().tolist())
+    if not species_options:
+        species_options = ["Sin clasificar"]
+
+    species_options = ["Todas"] + species_options
     default_index = species_options.index(default_species) if default_species in species_options else 0
     selected_species = st.selectbox(label, species_options, index=default_index)
-
     if selected_species == "Todas":
         filtered_products = repository.products.copy()
     else:
         filtered_products = repository.products[repository.products["species"] == selected_species].copy()
-
-    filtered_products = filtered_products.sort_values(["species", "product_name", "spec_id"]).reset_index(drop=True)
     return selected_species, filtered_products
 
 
 st.title("Comparador técnico de fórmulas | Rebranding")
 st.caption(
     "La aplicación lee el formato de exportación tipo Multi-Mix del Excel, reconstruye cada fórmula y propone los productos destino más parecidos."
+)
+st.info(
+    "El ranking de similitud es una ayuda de priorización. Ordena candidatos por cercanía nutricional, ingredientes, límites y precio, pero la decisión final sigue siendo técnica."
 )
 
 with st.sidebar:
@@ -874,9 +1084,22 @@ with st.sidebar:
         "limits": st.slider("Peso límites", 0.0, 1.0, float(DEFAULT_COMPONENT_WEIGHTS["limits"]), 0.05),
         "price": st.slider("Peso precio", 0.0, 1.0, float(DEFAULT_COMPONENT_WEIGHTS["price"]), 0.05),
     }
-    st.info(
-        "El score es heurístico: combina diferencias de nutrientes, composición de ingredientes, compatibilidad de límites y precio. Un score más bajo indica mayor similitud."
+
+    st.header("3) Ayuda")
+    if st.button("Mostrar / ocultar README"):
+        st.session_state["show_readme"] = not st.session_state.get("show_readme", False)
+    st.download_button(
+        label="Descargar README.md",
+        data=load_readme_text().encode("utf-8"),
+        file_name="README.md",
+        mime="text/markdown",
     )
+    with st.expander("Cómo leer el análisis heurístico", expanded=False):
+        st.markdown(heuristic_help_markdown())
+
+if st.session_state.get("show_readme", False):
+    with st.expander("README / guía rápida de uso", expanded=True):
+        st.markdown(load_readme_text())
 
 if not source_file or not target_file:
     st.warning("Sube los dos archivos Excel para empezar.")
@@ -910,7 +1133,7 @@ with sel_col1:
 
 with sel_col2:
     selected_target_species, target_products_filtered = repository_selector(
-        "Especie destino", target_repo, default_species=selected_source_species if selected_source_species != "Todas" else None
+        "Especie destino", target_repo, default_species=selected_source_species
     )
     compare_all_target_species = st.checkbox("Comparar contra toda la gama destino", value=False)
     if compare_all_target_species:
@@ -931,16 +1154,31 @@ if not common_metrics:
     st.error("No hay métricas analíticas comunes entre el producto origen y la gama destino filtrada.")
     st.stop()
 
-default_metrics = auto_select_metrics(common_metrics, selected_source_species)
+saved_metrics, saved_metric_weights = get_metric_preferences(selected_source_species, common_metrics)
+species_key = species_pref_key(selected_source_species)
+metric_multiselect_key = f"selected_metrics_{species_key}"
+
+if metric_multiselect_key not in st.session_state:
+    st.session_state[metric_multiselect_key] = saved_metrics
+else:
+    filtered_metrics = [metric for metric in st.session_state[metric_multiselect_key] if metric in common_metrics]
+    st.session_state[metric_multiselect_key] = filtered_metrics or saved_metrics
 
 st.subheader("Selección de métricas críticas")
 metric_selector_col1, metric_selector_col2 = st.columns([1.4, 1])
 with metric_selector_col1:
+    st.caption(
+        "La selección de métricas y sus pesos se conserva por especie durante la sesión para no tener que redefinirla en cada comparación."
+    )
+    if st.button("Restaurar selección automática recomendada"):
+        reset_metric_preferences(selected_source_species)
+        st.rerun()
+
     selected_metrics = st.multiselect(
         "Métricas incluidas en la comparación",
         options=common_metrics,
-        default=default_metrics,
-        help="Puedes ajustar manualmente qué nutrientes/analíticas entran en el score.",
+        key=metric_multiselect_key,
+        help="Puedes ajustar manualmente qué nutrientes/analíticas entran en el score. La app conservará esta selección al cambiar de pienso dentro de la misma especie.",
     )
 with metric_selector_col2:
     st.write("**Producto origen**")
@@ -964,19 +1202,22 @@ if not selected_metrics:
 weight_editor_df = pd.DataFrame(
     {
         "Métrica": selected_metrics,
-        "Peso": [default_metric_weight(metric, selected_source_species) for metric in selected_metrics],
+        "Peso": [saved_metric_weights.get(metric, default_metric_weight(metric, selected_source_species)) for metric in selected_metrics],
     }
 )
 
 st.write("**Pesos por métrica**")
+weights_editor_key = f"weights_editor_{species_key}_{stable_metrics_signature(selected_metrics)}"
 edited_weights_df = st.data_editor(
     weight_editor_df,
+    key=weights_editor_key,
     use_container_width=True,
     hide_index=True,
     disabled=["Métrica"],
     column_config={"Peso": st.column_config.NumberColumn(min_value=0.1, max_value=10.0, step=0.1)},
 )
 metric_weights = dict(zip(edited_weights_df["Métrica"], edited_weights_df["Peso"]))
+save_metric_preferences(selected_source_species, selected_metrics, metric_weights)
 
 ranking_df, detail_map = compare_product_against_candidates(
     base_product_id=source_product_id,
@@ -1034,6 +1275,23 @@ with result_tabs[0]:
         data=export_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="ranking_rebranding.csv",
         mime="text/csv",
+    )
+
+    report_text = build_comparison_report_text(
+        source_product_row=source_product_row,
+        selected_metrics=selected_metrics,
+        metric_weights=metric_weights,
+        component_weights=component_weights,
+        ranking_top=ranking_top,
+        detail_map=detail_map,
+        source_repo=source_repo,
+        target_repo=target_repo,
+    )
+    st.download_button(
+        label="Descargar informe comparativo en TXT",
+        data=report_text.encode("utf-8-sig"),
+        file_name=f"informe_comparativo_{source_product_row['spec_id']}.txt",
+        mime="text/plain",
     )
 
 with result_tabs[1]:
