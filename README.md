@@ -11,7 +11,7 @@ Aplicación en Streamlit para comparar un pienso actual contra una gama estánda
   - precio por tonelada
   - ingredientes incluidos y sus límites
   - analíticas/nutrientes
-- Permite filtrar por especie.
+- Permite filtrar por especie o trabajar con **todas** las especies del fichero.
 - Calcula un ranking de similitud entre un pienso origen y los productos destino.
 - Devuelve el **top N** de equivalencias propuestas.
 - Muestra detalle por candidato:
@@ -19,8 +19,13 @@ Aplicación en Streamlit para comparar un pienso actual contra una gama estánda
   - diferencias en ingredientes
   - compatibilidad de límites
   - diferencia de precio
+- Conserva por especie, durante la sesión, la **selección de métricas** y sus **pesos** para no tener que redefinirlos cada vez.
+- Permite descargar:
+  - ranking en CSV
+  - informe comparativo en TXT
+  - README desde la propia app
 
-## Lógica del score
+## Cómo leer el score heurístico
 
 El score total combina 4 componentes:
 
@@ -29,7 +34,12 @@ El score total combina 4 componentes:
 3. **Límites de ingredientes**
 4. **Precio**
 
-Un score más bajo significa mayor parecido.
+Un score más bajo significa **mayor parecido relativo** dentro de esa comparación.
+
+Importante:
+- el score sirve para **ordenar candidatos**, no para aprobar automáticamente un cambio
+- un candidato puede quedar bien posicionado y aun así requerir revisión técnica si falla en una métrica crítica o en un límite de ingrediente
+- la decisión final debe validarse con criterio técnico, viabilidad industrial, coste y encaje comercial
 
 Los pesos globales y los pesos por métrica se pueden editar en la interfaz.
 
@@ -61,6 +71,8 @@ La app está pensada para archivos con una estructura equivalente al Excel de ej
 - bloque `ANALYSIS`
 - opcionalmente bloque `RAW MATERIAL SENSITIVITY`
 
+También admite identificadores de especificación alfanuméricos, por ejemplo `QC99`.
+
 Si algún repositorio usa otra maqueta, habrá que ajustar el parser.
 
 ## Recomendaciones siguientes
@@ -72,3 +84,4 @@ Para una versión 2 convendría añadir:
 - exportación a Excel con informe comparativo
 - histórico de decisiones y validación final
 - clasificación más precisa de especies y subespecies
+- perfiles de pesos guardados de forma persistente entre sesiones
