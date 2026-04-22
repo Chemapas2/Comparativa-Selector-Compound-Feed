@@ -23,6 +23,10 @@ SPEC_LINE_RE = re.compile(
     r"Specification:\s*([^\s]+)\s+(.+?)\s*:\s*Cost/tonne:\s*([0-9.]+)",
     re.IGNORECASE,
 )
+SINGLE_MIX_SPEC_LINE_RE = re.compile(
+    r"SP:\s*([^\s]+)\s+(.+?)\s+[0-9.,]+\s*%\s*,\s*[0-9.,]+\s*Kg\s*\(Recost:\s*([0-9.,]+)\)",
+    re.IGNORECASE,
+)
 
 SPECIES_RULES: List[Tuple[str, List[str]]] = [
     (
@@ -250,11 +254,16 @@ def read_lines_from_excel(file_bytes: bytes, filename: str) -> Tuple[List[str], 
     return lines, first_sheet_name
 
 
+def is_formula_start_line(line: str) -> bool:
+    normalized = normalize_text(line)
+    return "Specification:" in normalized or bool(SINGLE_MIX_SPEC_LINE_RE.search(normalized))
+
+
 def split_formula_blocks(lines: List[str]) -> List[List[str]]:
-    starts = [idx for idx, line in enumerate(lines) if "Specification:" in line]
+    starts = [idx for idx, line in enumerate(lines) if is_formula_start_line(line)]
     if not starts:
         raise ValueError(
-            "No se han encontrado bloques con 'Specification:'. El Excel no parece tener el mismo formato que el ejemplo."
+            "No se han encontrado bloques reconocibles de fórmula. La app espera exportaciones tipo Multi-Mix ('Specification:') o Single-Mix ('SP:')."
         )
 
     blocks: List[List[str]] = []
@@ -266,19 +275,34 @@ def split_formula_blocks(lines: List[str]) -> List[List[str]]:
 
 
 def parse_spec_line(line: str) -> dict:
-    match = SPEC_LINE_RE.search(line)
-    if not match:
-        return {}
+    normalized = normalize_text(line)
 
-    raw_product = normalize_text(match.group(2))
-    code, product_name = split_product_code_and_name(raw_product)
-    return {
-        "spec_id": match.group(1),
-        "product_raw": raw_product,
-        "product_code": code,
-        "product_name": product_name,
-        "cost_tonne": safe_float(match.group(3)),
-    }
+    match = SPEC_LINE_RE.search(normalized)
+    if match:
+        raw_product = normalize_text(match.group(2))
+        code, product_name = split_product_code_and_name(raw_product)
+        return {
+            "spec_id": match.group(1),
+            "product_raw": raw_product,
+            "product_code": code,
+            "product_name": product_name,
+            "cost_tonne": safe_float(match.group(3)),
+            "source_format": "multimix",
+        }
+
+    match = SINGLE_MIX_SPEC_LINE_RE.search(normalized)
+    if match:
+        raw_product = normalize_text(match.group(2))
+        return {
+            "spec_id": match.group(1),
+            "product_raw": raw_product,
+            "product_code": "",
+            "product_name": raw_product,
+            "cost_tonne": safe_float(match.group(3)),
+            "source_format": "singlemix",
+        }
+
+    return {}
 
 
 def split_product_code_and_name(raw_product: str) -> Tuple[str, str]:
@@ -293,20 +317,24 @@ def find_section_indices(block_lines: List[str]) -> dict:
     positions = {
         "ingredients_start": None,
         "analysis_start": None,
+        "rejected_start": None,
         "sensitivity_start": None,
     }
     for idx, line in enumerate(block_lines):
-        if "INCLUDED RAW MATERIALS" in line:
+        normalized = normalize_text(line).upper()
+        if "INCLUDED RAW MATERIALS" in normalized:
             positions["ingredients_start"] = idx + 2
-        elif line.strip().startswith("ANALYSIS"):
+        elif "REJECTED RAW MATERIALS" in normalized and positions["rejected_start"] is None:
+            positions["rejected_start"] = idx
+        elif normalized.startswith("ANALYSIS") or "NUTRIENT ANALYSIS" in normalized:
             positions["analysis_start"] = idx + 2
-        elif "RAW MATERIAL SENSITIVITY" in line:
+        elif "RAW MATERIAL SENSITIVITY" in normalized:
             positions["sensitivity_start"] = idx
             break
     return positions
 
 
-def parse_ingredient_line(line: str) -> dict | None:
+def parse_ingredient_line_multimix(line: str) -> dict | None:
     tokens = line.split()
     if len(tokens) < 7:
         return None
@@ -351,7 +379,67 @@ def parse_ingredient_line(line: str) -> dict | None:
     }
 
 
-def parse_analysis_line(line: str) -> dict | None:
+def parse_ingredient_line_singlemix(line: str) -> dict | None:
+    tokens = line.split()
+    if len(tokens) < 8:
+        return None
+
+    start_idx = None
+    for idx in range(1, len(tokens) - 2):
+        if token_is_numeric(tokens[idx]) and token_is_numeric(tokens[idx + 1]) and token_is_numeric(tokens[idx + 2]):
+            pct_value = safe_float(tokens[idx])
+            kilos_value = safe_float(tokens[idx + 1])
+            avg_cost_value = safe_float(tokens[idx + 2])
+            pct_ok = pd.isna(pct_value) or (0.0 <= pct_value <= 100.0)
+            kilos_ok = pd.notna(kilos_value) and (pd.isna(pct_value) or kilos_value >= pct_value)
+            avg_cost_ok = pd.notna(avg_cost_value) and avg_cost_value >= 10.0
+            if pct_ok and kilos_ok and avg_cost_ok:
+                start_idx = idx
+                break
+
+    if start_idx is None or start_idx < 2:
+        return None
+
+    head = tokens[:start_idx]
+    ingredient_key = normalize_text(head[0])
+    ingredient_name = normalize_text(" ".join(head[1:]))
+    ingredient_label = normalize_text(f"{ingredient_key} {ingredient_name}")
+
+    pct_token = tokens[start_idx]
+    kilos_token = tokens[start_idx + 1]
+    avg_cost_token = tokens[start_idx + 2]
+    idx = start_idx + 3
+
+    limit_token = ""
+    if idx < len(tokens) and not token_is_numeric(tokens[idx]):
+        limit_token = normalize_text(tokens[idx]).upper()
+        idx += 1
+
+    min_token = tokens[idx] if idx < len(tokens) else np.nan
+    max_token = tokens[idx + 1] if idx + 1 < len(tokens) else np.nan
+    kilos_value = safe_float(kilos_token)
+
+    return {
+        "ingredient_key": ingredient_key,
+        "ingredient_name": ingredient_name,
+        "ingredient_label": ingredient_label,
+        "avg_cost": safe_float(avg_cost_token),
+        "pct": safe_float(pct_token),
+        "kilos": kilos_value,
+        "tonnes": kilos_value / 1000.0 if pd.notna(kilos_value) else np.nan,
+        "limit_type": limit_token,
+        "min": safe_float(min_token),
+        "max": safe_float(max_token),
+    }
+
+
+def parse_ingredient_line(line: str, source_format: str) -> dict | None:
+    if source_format == "singlemix":
+        return parse_ingredient_line_singlemix(line)
+    return parse_ingredient_line_multimix(line)
+
+
+def parse_analysis_line_multimix(line: str) -> dict | None:
     tokens = line.split()
     if len(tokens) < 2:
         return None
@@ -387,6 +475,49 @@ def parse_analysis_line(line: str) -> dict | None:
     }
 
 
+def parse_analysis_line_singlemix(line: str) -> dict | None:
+    tokens = line.split()
+    if len(tokens) < 3:
+        return None
+
+    if tokens[:3] == ["[", "PESO", "]"]:
+        analysis_name = "[PESO]"
+        rest = tokens[3:]
+    else:
+        analysis_name = tokens[0]
+        rest = tokens[1:]
+        if rest and not token_is_numeric(rest[0]):
+            rest = rest[1:]
+
+    if not rest:
+        return None
+
+    level = safe_float(rest[0])
+    idx = 1
+    limit_type = ""
+    if idx < len(rest) and not token_is_numeric(rest[idx]):
+        limit_type = normalize_text(rest[idx]).upper()
+        idx += 1
+
+    minimum = safe_float(rest[idx]) if idx < len(rest) else np.nan
+    maximum = safe_float(rest[idx + 1]) if idx + 1 < len(rest) else np.nan
+
+    return {
+        "analysis_name": normalize_text(analysis_name),
+        "level": level,
+        "limit_type": limit_type,
+        "min": minimum,
+        "max": maximum,
+        "without_dummies": np.nan,
+    }
+
+
+def parse_analysis_line(line: str, source_format: str) -> dict | None:
+    if source_format == "singlemix":
+        return parse_analysis_line_singlemix(line)
+    return parse_analysis_line_multimix(line)
+
+
 @st.cache_data(show_spinner=False)
 def parse_repository(file_bytes: bytes, filename: str) -> Repository:
     lines, sheet_name = read_lines_from_excel(file_bytes, filename)
@@ -401,6 +532,7 @@ def parse_repository(file_bytes: bytes, filename: str) -> Repository:
         if not spec_meta:
             continue
 
+        source_format = spec_meta.get("source_format", "multimix")
         positions = find_section_indices(block)
         product_id = f"{spec_meta['spec_id']}__{spec_meta['product_raw']}"
         species = infer_species(spec_meta["product_name"], filename)
@@ -417,16 +549,29 @@ def parse_repository(file_bytes: bytes, filename: str) -> Repository:
                 "cost_tonne": spec_meta["cost_tonne"],
                 "source_file": filename,
                 "sheet_name": sheet_name,
+                "source_format": source_format,
             }
         )
 
         if positions["ingredients_start"] is not None and positions["analysis_start"] is not None:
-            ingredient_lines = block[positions["ingredients_start"] : positions["analysis_start"] - 2]
+            ingredient_end = positions["analysis_start"] - 2
+            if positions.get("rejected_start") is not None:
+                ingredient_end = min(ingredient_end, positions["rejected_start"])
+            if source_format == "singlemix":
+                ingredient_end = positions["analysis_start"] - 1
+                if positions.get("rejected_start") is not None:
+                    ingredient_end = min(ingredient_end, positions["rejected_start"])
+            ingredient_lines = block[positions["ingredients_start"] : max(positions["ingredients_start"], ingredient_end)]
             for line in ingredient_lines:
                 stripped = line.strip()
-                if not stripped or stripped.startswith("-"):
+                if (
+                    not stripped
+                    or stripped.startswith("-")
+                    or "REJECTED RAW MATERIALS" in stripped.upper()
+                    or "NUTRIENT ANALYSIS" in stripped.upper()
+                ):
                     continue
-                parsed = parse_ingredient_line(line)
+                parsed = parse_ingredient_line(line, source_format=source_format)
                 if parsed:
                     ingredient_rows.append({"product_id": product_id, **parsed})
 
@@ -435,9 +580,19 @@ def parse_repository(file_bytes: bytes, filename: str) -> Repository:
             analysis_lines = block[positions["analysis_start"] : end]
             for line in analysis_lines:
                 stripped = line.strip()
-                if not stripped or stripped.startswith("-") or "RAW MATERIAL SENSITIVITY" in stripped:
+                upper = stripped.upper()
+                if (
+                    not stripped
+                    or stripped.startswith("-")
+                    or stripped.startswith(":")
+                    or stripped.startswith("=")
+                    or upper.startswith("_X")
+                    or "RAW MATERIAL SENSITIVITY" in upper
+                    or "REJECTED RAW MATERIALS" in upper
+                    or "INCLUDED RAW MATERIALS" in upper
+                ):
                     continue
-                parsed = parse_analysis_line(line)
+                parsed = parse_analysis_line(line, source_format=source_format)
                 if parsed:
                     analysis_rows.append({"product_id": product_id, **parsed})
 
@@ -1048,6 +1203,129 @@ def build_comparison_report_text(
     return "\n".join(lines)
 
 
+
+def sanitize_sheet_name(name: str) -> str:
+    cleaned = re.sub(r"[\\/*?:\[\]]", "_", str(name))
+    cleaned = cleaned[:31].strip()
+    return cleaned or "Hoja"
+
+
+def autosize_openpyxl_worksheet(worksheet) -> None:
+    for column_cells in worksheet.columns:
+        values = ["" if cell.value is None else str(cell.value) for cell in column_cells]
+        max_length = max((len(value) for value in values), default=0)
+        column_letter = column_cells[0].column_letter
+        worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 40)
+
+
+def build_excel_export_bytes(
+    source_product_row: pd.Series,
+    ranking_df: pd.DataFrame,
+    ranking_top: pd.DataFrame,
+    detail_map: Dict[str, dict],
+    selected_metrics: List[str],
+    metric_weights: Dict[str, float],
+    component_weights: Dict[str, float],
+    source_repo: Repository,
+    target_repo: Repository,
+    include_full_ranking: bool = True,
+) -> bytes:
+    output = io.BytesIO()
+
+    resumen_df = pd.DataFrame(
+        [
+            {"Campo": "Archivo origen", "Valor": source_repo.filename},
+            {"Campo": "Archivo destino", "Valor": target_repo.filename},
+            {"Campo": "Especie origen", "Valor": source_product_row["species"]},
+            {"Campo": "Producto origen", "Valor": source_product_row["product_name"]},
+            {"Campo": "Spec origen", "Valor": source_product_row["spec_id"]},
+            {"Campo": "Precio origen €/t", "Valor": float(source_product_row["cost_tonne"])},
+        ]
+    )
+
+    component_weights_df = pd.DataFrame(
+        [{"Componente": key, "Peso": value} for key, value in component_weights.items()]
+    )
+    metric_weights_df = pd.DataFrame(
+        [{"Métrica": metric, "Peso": metric_weights.get(metric, 1.0)} for metric in selected_metrics]
+    )
+
+    ranking_export_df = ranking_df.copy() if include_full_ranking else ranking_top.copy()
+    if "candidate_id" in ranking_export_df.columns:
+        ranking_export_df = ranking_export_df.drop(columns=["candidate_id"])
+    ranking_export_df = ranking_export_df.rename(
+        columns={
+            "display_name": "producto_destino",
+            "cost_tonne": "precio_eur_t",
+            "total_score": "score_total",
+            "nutrient_score": "score_nutrientes",
+            "ingredient_score": "score_ingredientes",
+            "limit_score": "score_limites",
+            "price_score": "score_precio",
+            "price_diff_pct": "dif_precio_pct",
+            "shared_ingredients": "ingredientes_compartidos",
+            "metric_coverage": "metricas_cubiertas",
+        }
+    )
+
+    report_text = build_comparison_report_text(
+        source_product_row=source_product_row,
+        selected_metrics=selected_metrics,
+        metric_weights=metric_weights,
+        component_weights=component_weights,
+        ranking_top=ranking_top,
+        detail_map=detail_map,
+        source_repo=source_repo,
+        target_repo=target_repo,
+    )
+    report_df = pd.DataFrame({"Informe": report_text.splitlines()})
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        resumen_df.to_excel(writer, sheet_name="Resumen", index=False, startrow=0)
+        component_weights_df.to_excel(writer, sheet_name="Resumen", index=False, startrow=len(resumen_df) + 3)
+        metric_weights_df.to_excel(writer, sheet_name="Resumen", index=False, startrow=len(resumen_df) + len(component_weights_df) + 7)
+
+        ranking_export_df.to_excel(writer, sheet_name="Ranking", index=False)
+        report_df.to_excel(writer, sheet_name="Informe", index=False)
+
+        for _, row in ranking_top.iterrows():
+            candidate_id = row["candidate_id"]
+            rank_label = f"{int(row['rank']):02d}"
+            metrics_df = detail_map[candidate_id]["metric_details"].copy()
+            ingredients_df = detail_map[candidate_id]["ingredient_details"].copy()
+
+            metrics_sheet = sanitize_sheet_name(f"{rank_label}_metricas")
+            ingredients_sheet = sanitize_sheet_name(f"{rank_label}_ingredientes")
+
+            metrics_df.to_excel(writer, sheet_name=metrics_sheet, index=False)
+            ingredients_df.to_excel(writer, sheet_name=ingredients_sheet, index=False)
+
+            workbook = writer.book
+            worksheet = workbook[metrics_sheet]
+            worksheet["J1"] = "Producto destino"
+            worksheet["J2"] = row["display_name"]
+            worksheet["J3"] = "Score total"
+            worksheet["J4"] = float(row["total_score"])
+            worksheet["J5"] = "Precio €/t"
+            worksheet["J6"] = float(row["cost_tonne"])
+
+            worksheet2 = workbook[ingredients_sheet]
+            worksheet2["L1"] = "Producto destino"
+            worksheet2["L2"] = row["display_name"]
+            worksheet2["L3"] = "Spec destino"
+            worksheet2["L4"] = row["spec_id"]
+            worksheet2["L5"] = "Dif. precio %"
+            worksheet2["L6"] = float(row["price_diff_pct"])
+
+        workbook = writer.book
+        for worksheet in workbook.worksheets:
+            autosize_openpyxl_worksheet(worksheet)
+            worksheet.freeze_panes = "A2"
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def repository_selector(label: str, repository: Repository, default_species: str | None = None) -> Tuple[str, pd.DataFrame]:
     species_options = sorted(repository.products["species"].dropna().unique().tolist())
     if not species_options:
@@ -1065,7 +1343,7 @@ def repository_selector(label: str, repository: Repository, default_species: str
 
 st.title("Comparador técnico de fórmulas | Rebranding")
 st.caption(
-    "La aplicación lee el formato de exportación tipo Multi-Mix del Excel, reconstruye cada fórmula y propone los productos destino más parecidos."
+    "La aplicación lee exportaciones tipo Multi-Mix y Single-Mix del Excel, reconstruye cada fórmula y propone los productos destino más parecidos."
 )
 st.info(
     "El ranking de similitud es una ayuda de priorización. Ordena candidatos por cercanía nutricional, ingredientes, límites y precio, pero la decisión final sigue siendo técnica."
@@ -1270,11 +1548,23 @@ with result_tabs[0]:
         "ingredientes_compartidos",
         "metricas_cubiertas",
     ]
+    excel_bytes = build_excel_export_bytes(
+        source_product_row=source_product_row,
+        ranking_df=ranking_df,
+        ranking_top=ranking_top,
+        detail_map=detail_map,
+        selected_metrics=selected_metrics,
+        metric_weights=metric_weights,
+        component_weights=component_weights,
+        source_repo=source_repo,
+        target_repo=target_repo,
+        include_full_ranking=True,
+    )
     st.download_button(
-        label="Descargar ranking en CSV",
-        data=export_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="ranking_rebranding.csv",
-        mime="text/csv",
+        label="Descargar resultados en Excel",
+        data=excel_bytes,
+        file_name=f"comparativa_rebranding_{source_product_row['spec_id']}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
     report_text = build_comparison_report_text(
